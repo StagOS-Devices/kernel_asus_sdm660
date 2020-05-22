@@ -22,7 +22,6 @@
 #include <linux/qpnp/qpnp-revid.h>
 #include "fg-core.h"
 #include "fg-reg.h"
-#include <linux/qpnp/qpnp-adc.h>
 
 #define FG_GEN3_DEV_NAME	"qcom,fg-gen3"
 
@@ -637,33 +636,24 @@ static int fg_get_jeita_threshold(struct fg_chip *chip,
 #define BATT_TEMP_DENR		1
 static int fg_get_battery_temp(struct fg_chip *chip, int *val)
 {
-	int rc = 0;
-	int64_t temp;
-	struct qpnp_vadc_result result;
+	int rc = 0, temp;
+	u8 buf[2];
 
-	chip->vadc_dev = qpnp_get_vadc(chip->dev, "vadc_therm");
-
-	if (IS_ERR(chip->vadc_dev)) {
-		rc = PTR_ERR(chip->vadc_dev);
-		if (rc != -EPROBE_DEFER)
-			pr_err("VADC property: vadc_therm missing\n");
+	rc = fg_read(chip, BATT_INFO_BATT_TEMP_LSB(chip), buf, 2);
+	if (rc < 0) {
+		pr_err("failed to read addr=0x%04x, rc=%d\n",
+			BATT_INFO_BATT_TEMP_LSB(chip), rc);
 		return rc;
 	}
 
+	temp = ((buf[1] & BATT_TEMP_MSB_MASK) << 8) |
+		(buf[0] & BATT_TEMP_LSB_MASK);
+	temp = DIV_ROUND_CLOSEST(temp, 4);
 
-	rc = qpnp_vadc_read(chip->vadc_dev, VADC_AMUX_THM3_PU2, &result);
-	if (!rc) {
-		temp = result.physical;
-		/* Value is in DegreeC; Convert it to deciDegC.
-		   Also, add an offset of -20 deciDegC, to report
-		   a more probable battery temperature. */
-		temp = (temp * 10) - 20;
-		*val = temp;
-		return rc;
-	} else {
-		pr_err("Unable to read battery_temp\n");
-		return rc;
-	}
+	/* Value is in Kelvin; Convert it to deciDegC */
+	temp = (temp - 273) * 10;
+	*val = temp;
+	return 0;
 }
 
 static int fg_get_battery_resistance(struct fg_chip *chip, int *val)
@@ -1222,7 +1212,7 @@ static int fg_awake_cb(struct votable *votable, void *data, int awake,
 	struct fg_chip *chip = data;
 
 	if (awake)
-		pm_wakeup_event(chip->dev, 500);
+		pm_stay_awake(chip->dev);
 	else
 		pm_relax(chip->dev);
 
@@ -1841,9 +1831,7 @@ static int fg_charge_full_update(struct fg_chip *chip)
 		msoc, bsoc, chip->health, chip->charge_status,
 		chip->charge_full);
 	if (chip->charge_done && !chip->charge_full) {
-		if (msoc >= 99 && (chip->health == POWER_SUPPLY_HEALTH_GOOD
-				|| chip->health == POWER_SUPPLY_HEALTH_COOL
-				|| chip->health == POWER_SUPPLY_HEALTH_WARM)) {
+		if (msoc >= 99 && chip->health == POWER_SUPPLY_HEALTH_GOOD) {
 			fg_dbg(chip, FG_STATUS, "Setting charge_full to true\n");
 			chip->charge_full = true;
 			/*
@@ -2584,86 +2572,6 @@ static void fg_ttf_update(struct fg_chip *chip)
 	schedule_delayed_work(&chip->ttf_work, msecs_to_jiffies(delay_ms));
 }
 
-static ssize_t fg_get_cycle_counts_bins(struct device *dev,
-					struct device_attribute *attr,
-					char *buf)
-{
-	struct fg_chip *chip = dev_get_drvdata(dev);
-	int rc = 0, i;
-	u8 data[2];
-	int length = 0;
-
-	mutex_lock(&chip->cyc_ctr.lock);
-	for (i = 0; i < BUCKET_COUNT; i++) {
-		rc = fg_sram_read(chip, CYCLE_COUNT_WORD + (i / 2),
-				  CYCLE_COUNT_OFFSET + (i % 2) * 2, data, 2,
-				  FG_IMA_DEFAULT);
-
-		if (rc < 0) {
-			pr_err("failed to read bucket %d rc=%d\n", i, rc);
-			chip->cyc_ctr.count[i] = 0;
-		} else
-			chip->cyc_ctr.count[i] = data[0] | data[1] << 8;
-
-		length += scnprintf(buf + length,
-				    PAGE_SIZE - length, "%d",
-				    chip->cyc_ctr.count[i]);
-
-		if (i == BUCKET_COUNT-1)
-			length += scnprintf(buf + length,
-					    PAGE_SIZE - length, "\n");
-		else
-			length += scnprintf(buf + length,
-					    PAGE_SIZE - length, " ");
-	}
-	mutex_unlock(&chip->cyc_ctr.lock);
-
-	return length;
-}
-
-static ssize_t fg_set_cycle_counts_bins(struct device *dev,
-					struct device_attribute *attr,
-					const char *buf, size_t count)
-{
-	struct fg_chip *chip = dev_get_drvdata(dev);
-	int rc = 0, strval[BUCKET_COUNT], bucket;
-	u16 cyc_count;
-	u8 data[2];
-
-	if (sscanf(buf, "%d %d %d %d %d %d %d %d",
-		   &strval[0], &strval[1], &strval[2], &strval[3],
-		   &strval[4], &strval[5], &strval[6], &strval[7])
-	    != BUCKET_COUNT)
-		return -EINVAL;
-
-	mutex_lock(&chip->cyc_ctr.lock);
-	for (bucket = 0; bucket < BUCKET_COUNT; bucket++) {
-		if (strval[bucket] > chip->cyc_ctr.count[bucket]) {
-			cyc_count = strval[bucket];
-			data[0] = cyc_count & 0xFF;
-			data[1] = cyc_count >> 8;
-
-			rc = fg_sram_write(chip,
-					CYCLE_COUNT_WORD + (bucket / 2),
-					CYCLE_COUNT_OFFSET + (bucket % 2) * 2,
-					data, 2, FG_IMA_DEFAULT);
-			if (rc < 0) {
-				pr_err("failed to write BATT_CYCLE[%d] rc=%d\n",
-				       bucket, rc);
-				mutex_unlock(&chip->cyc_ctr.lock);
-				return rc;
-			}
-			chip->cyc_ctr.count[bucket] = cyc_count;
-		}
-	}
-	mutex_unlock(&chip->cyc_ctr.lock);
-
-	return count;
-}
-
-static DEVICE_ATTR(cycle_counts_bins, 0660,
-		   fg_get_cycle_counts_bins, fg_set_cycle_counts_bins);
-
 static void restore_cycle_counter(struct fg_chip *chip)
 {
 	int rc = 0, i;
@@ -2700,7 +2608,7 @@ static void clear_cycle_counter(struct fg_chip *chip)
 	}
 	rc = fg_sram_write(chip, CYCLE_COUNT_WORD, CYCLE_COUNT_OFFSET,
 			(u8 *)&chip->cyc_ctr.count,
-			sizeof(chip->cyc_ctr.count) / (sizeof(u8 *)),
+			sizeof(chip->cyc_ctr.count) / sizeof(u8 *),
 			FG_IMA_DEFAULT);
 	if (rc < 0)
 		pr_err("failed to clear cycle counter rc=%d\n", rc);
@@ -3361,13 +3269,8 @@ static int fg_get_time_to_full_locked(struct fg_chip *chip, int *val)
 	vbatt_avg /= MILLI_UNIT;
 
 	/* clamp ibatt_avg to iterm */
-	if ((msoc > 70) && (msoc <= 90)) {
-		if (ibatt_avg < 1000)
-			ibatt_avg = 1000; /* force consistent minumum charging current 1000mA upto 90% battery */
-	} else {
-		if (ibatt_avg < abs(chip->dt.sys_term_curr_ma))
-			ibatt_avg = abs(chip->dt.sys_term_curr_ma);
-	}
+	if (ibatt_avg < abs(chip->dt.sys_term_curr_ma))
+		ibatt_avg = abs(chip->dt.sys_term_curr_ma);
 
 	fg_dbg(chip, FG_TTF, "ibatt_avg=%d\n", ibatt_avg);
 	fg_dbg(chip, FG_TTF, "vbatt_avg=%d\n", vbatt_avg);
@@ -4539,6 +4442,7 @@ static irqreturn_t fg_batt_missing_irq_handler(int irq, void *data)
 
 	clear_battery_profile(chip);
 	schedule_delayed_work(&chip->profile_load_work, 0);
+
 	if (chip->fg_psy)
 		power_supply_changed(chip->fg_psy);
 
@@ -5140,8 +5044,6 @@ static int fg_parse_dt(struct fg_chip *chip)
 			pr_warn("Error reading Jeita thresholds, default values will be used rc:%d\n",
 				rc);
 	}
-	chip->dt.jeita_thresholds[JEITA_WARM] = 97;
-	chip->dt.jeita_thresholds[JEITA_HOT] = 97;
 
 	if (of_property_count_elems_of_size(node,
 		"qcom,battery-thermal-coefficients",
@@ -5437,12 +5339,6 @@ static int fg_gen3_probe(struct platform_device *pdev)
 		goto exit;
 	}
 
-	rc = device_create_file(chip->dev, &dev_attr_cycle_counts_bins);
-	if (rc != 0) {
-		dev_err(chip->dev,
-			"Failed to create cycle_counts_bins files: %d\n", rc);
-	}
-
 	mutex_init(&chip->bus_lock);
 	mutex_init(&chip->sram_rw_lock);
 	mutex_init(&chip->cyc_ctr.lock);
@@ -5538,6 +5434,7 @@ static int fg_gen3_probe(struct platform_device *pdev)
 
 	device_init_wakeup(chip->dev, true);
 	schedule_delayed_work(&chip->profile_load_work, 0);
+
 	pr_debug("FG GEN3 driver probed successfully\n");
 	return 0;
 exit:

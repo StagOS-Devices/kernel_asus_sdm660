@@ -340,6 +340,7 @@ static __ref int do_sampling(void *data)
 		}
 		if (!poll_ms)
 			goto unlock;
+
 		schedule_delayed_work(&sampling_work,
 			msecs_to_jiffies(poll_ms));
 unlock:
